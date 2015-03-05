@@ -2,6 +2,7 @@ import logging
 import socket
 
 from collections import deque
+from functools import partial
 
 import hiredis
 
@@ -18,17 +19,128 @@ logger = logging.getLogger(__name__)
 
 
 class Client(RedisCommandsMixin):
-    """
-        Redis client class
-    """
-    def __init__(self, io_loop=None):
+    def __init__(self, io_loop=None, host='localhost', port=6379, usock=None, pool=None, callback=None):
         """
             Constructor
+            :param io_loop:
+                IOLoop instance to use, will be ignored if pool is present
+            :param host:
+                Host to connect to
+            :param port:
+                Port
+            :param usock:
+                The unix socket to connect to (host and port are ignored if this is present)
+            :param pool:
+                The connection pool to use
+        """
+        self._pool = pool
+        if self._pool is not None:
+            self._connection = pool.get_connection(callback)
+        else:
+            self._connection = Connection(host=host, port=port, usock=usock, io_loop=io_loop)
+            self._connection.connect(callback)
 
+    def close(self):
+        if self._pool:
+            self._pool.release_connection(self._connection)
+            self._connection = None
+        else:
+            self._connection.close()
+            self._connection = None
+
+    def send_message(self, args, callback=None):
+        self._connection.send_message(args, callback=callback)
+
+    def send_messages(self, args_pipeline, callback=None):
+        self._connection.send_messages(args_pipeline, callback=callback)
+
+    def psubscribe(self, patterns, callback=None):
+        if self._pool:
+            raise Exception("Should not use PSUBSCRIBE using connections from a pool, create a dedicated connection instead")
+        logger.debug("wat?")
+        self._connection.set_sub_callback(callback)
+        super(Client, self).psubscribe(patterns, callback=None)
+
+    def subscribe(self, channels, callback=None):
+        if self._pool:
+            raise Exception("Should not use SUBSCRIBE using connections from a pool, create a dedicated connection instead")
+        self._connection.set_sub_callback(callback)
+        super(Client, self).subscribe(channels, callback=None)
+
+    def pipeline(self):
+        return Pipeline(self._connection)
+
+
+class ConnectionPool(object):
+    def __init__(self, io_loop=None, host='localhost', port=6379, usock=None):
+        """
+            Constructor
+            :param host:
+                Host to connect to
+            :param port:
+                Port
+            :param usock:
+                (Optional) The unix socket to connect to (host and port are ignored if this is present)
             :param io_loop:
                 Optional IOLoop instance
         """
         self._io_loop = io_loop or IOLoop.instance()
+        self._host = host
+        self._port = port
+        self._usock = usock
+
+        self._connections = deque()
+
+    def get_connection(self, callback=None):
+        # TODO: support multiple ioloops?
+        # TODO: limit the number of connections possible
+        try:
+            connection = self._connections.popleft()
+            if not connection.is_connected():
+                connection.connect(callback)
+            elif callback is not None:
+                self._io_loop.add_callback(callback)
+            return connection
+        except IndexError:
+            return self.make_connection(callback)
+
+    def make_connection(self, callback=None):
+        connection = Connection(host=self._host, port=self._port,
+                                usock=self._usock, io_loop=self._io_loop)
+        connection.connect(callback)
+        return connection
+
+    def _release(self, connection):
+        # TODO: figure out what else we should to do here, probably should call connection._on_close
+        self._conncetions.append(connection)
+
+
+    def release_connection(self, connection):
+        if not isinstance(connection, Connection):
+            raise Exception("Trying to release non-connection")
+        connection.when_idle(self.release_connection, connection)
+
+
+class Connection(object):
+    """
+        Redis connection class
+    """
+    def __init__(self, host='localhost', port=6379, usock=None, io_loop=None):
+        """
+            Constructor
+            :param host:
+                Host to connect to
+            :param port:
+                Port
+            :param usock:
+                (Optional) The unix socket to connect to (host and port are ignored if this is present)
+            :param io_loop:
+                Optional IOLoop instance
+        """
+        self._io_loop = io_loop or IOLoop.instance()
+
+        self._addr = usock if usock else (host, port)
+        self._prot = socket.AF_UNIX if usock else socket.AF_INET
 
         self._stream = None
 
@@ -37,26 +149,18 @@ class Client(RedisCommandsMixin):
 
         self._sub_callback = False
 
-    def connect(self, host='localhost', port=6379, callback=None):
+        # function to call when the connection becomes idle
+        self._when_idle = None
+
+    def connect(self, callback=None):
         """
             Connect to redis server
 
-            :param host:
-                Host to connect to
-            :param port:
-                Port
             :param callback:
-                Optional callback to be triggered upon connection
+                (Optional) callback to be triggered upon connection
         """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-        return self._connect(sock, (host, port), callback)
-
-    def connect_usocket(self, usock, callback=None):
-        """
-            Connect to redis server with unix socket
-        """
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
-        return self._connect(sock, usock, callback)
+        sock = socket.socket(self._prot, socket.SOCK_STREAM, 0)
+        self._connect(sock, self._addr, callback)
 
     def on_disconnect(self):
         """
@@ -147,31 +251,7 @@ class Client(RedisCommandsMixin):
         self._stream.close()
 
     # Pub/sub commands
-    def psubscribe(self, patterns, callback=None):
-        """
-            Customized psubscribe command - will keep one callback for all incoming messages
-
-            :param patterns:
-                string or list of strings
-            :param callback:
-                callback
-        """
-        self._set_sub_callback(callback)
-        super(Client, self).psubscribe(patterns)
-
-    def subscribe(self, channels, callback=None):
-        """
-            Customized subscribe command - will keep one callback for all incoming messages
-
-            :param channels:
-                string or list of strings
-            :param callback:
-                Callback
-        """
-        self._set_sub_callback(callback)
-        super(Client, self).subscribe(channels)
-
-    def _set_sub_callback(self, callback):
+    def set_sub_callback(self, callback):
         if self._sub_callback is None:
             self._sub_callback = callback
 
@@ -222,6 +302,9 @@ class Client(RedisCommandsMixin):
                     logger.debug('Ignored response: %s' % repr(resp))
 
             resp = self.reader.gets()
+        if self._when_idle and len(self.callbacks) == 0:
+            self._when_idle()
+            self._when_idle = None
 
     def _on_close(self, data=None):
         if data is not None:
@@ -254,5 +337,8 @@ class Client(RedisCommandsMixin):
         self.reader = hiredis.Reader()
         self._sub_callback = None
 
-    def pipeline(self):
-        return Pipeline(self)
+    def when_idle(self, fn, *args, **kwargs):
+        if self.is_idle():
+            fn(*args, **kwargs)
+            return
+        self._when_idle = partial(fn, *args, **kwargs)
